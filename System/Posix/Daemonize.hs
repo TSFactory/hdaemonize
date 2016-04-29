@@ -1,13 +1,13 @@
 {-# LANGUAGE RankNTypes #-}
 module System.Posix.Daemonize (
   -- * Simple daemonization
-  daemonize, 
+  daemonize,
   -- * Building system services
-  serviced, CreateDaemon(..), simpleDaemon,
-  -- * Intradaemon utilities                              
+  serviced, ServiceAction(..), servicedNoArgs, CreateDaemon(..), simpleDaemon,
+  -- * Intradaemon utilities
   fatalError, exitCleanly
-  -- * An example                              
-  --                               
+  -- * An example
+  --
   -- | Here is an example of a full program which writes a message to
   -- syslog once a second proclaiming its continued existance, and
   -- which installs its own SIGHUP handler.  Note that you won't
@@ -135,17 +135,45 @@ daemonize program =
 --   matters, the name of the daemon is by default the name of the
 --   executable file, but can again be set to something else in the
 --   'CreateDaemon' record.
--- 
+--
 --   Finally, exceptions in the program are caught, logged to syslog,
 --   and the program restarted.
 
 serviced :: CreateDaemon a -> IO ()
-serviced daemon = do 
-  systemName <- getProgName
-  let daemon' = daemon { name = if isNothing (name daemon) 
-                                then Just systemName else name daemon }
+serviced daemon = do
   args <- getArgs
-  process daemon' args
+  let maybeAction = case args of
+        ["start"] -> Just ServiceActionStart
+        ["stop"] -> Just ServiceActionStop
+        ["restart"] -> Just ServiceActionRestart
+        ["status"] -> Just ServiceActionStatus
+        _ -> Nothing
+  case maybeAction of
+    Just a -> servicedNoArgs a daemon
+    Nothing ->
+      getProgName >>= \pname -> putStrLn $ "usage: " ++ pname ++ " {start|stop|status|restart}"
+
+-- | Action to be performed by service binary. Serves the same purpose as command
+-- line arguments like "start" or "stop" for 'serviced'.
+data ServiceAction
+  = ServiceActionStart
+  | ServiceActionStop
+  | ServiceActionRestart
+  | ServiceActionStatus
+  deriving (Eq, Show)
+
+-- | Does the same thing as 'serviced' except for this function doesn't parse
+-- command-line argument and relies on an explicitly passed 'ServiceAction'
+-- instead.
+--
+-- This can be useful for implementing programs that can run both as a daemon
+-- or as a regular console application.
+servicedNoArgs :: ServiceAction -> CreateDaemon a -> IO ()
+servicedNoArgs action daemon = do
+  systemName <- getProgName
+  let daemon' = daemon { name = if isNothing (name daemon)
+                                then Just systemName else name daemon }
+  process daemon' action
     where
 #if MIN_VERSION_hsyslog(2,0,0)
       program' daemon = withSyslog (fromJust $ name daemon) (syslogOptions daemon) DAEMON [] $
@@ -159,16 +187,16 @@ serviced daemon = do
                          dropPrivileges daemon
                          forever $ program daemon $ privVal
 
-      process daemon ["start"] = pidExists daemon >>= f where
+      process daemon ServiceActionStart = pidExists daemon >>= f where
           f True  = do error "PID file exists. Process already running?"
                        exitImmediately (ExitFailure 1)
           f False = daemonize (program' daemon)
-                 
-      process daemon ["stop"]  = 
+
+      process daemon ServiceActionStop  =
           do pid <- pidRead daemon
              case pid of
                Nothing  -> pass
-               Just pid -> 
+               Just pid ->
                    (do whenM (pidLive pid) $
                             do signalProcess sigTERM pid
                                usleep (10^3)
@@ -176,10 +204,10 @@ serviced daemon = do
                    `finally`
                    removeLink (pidFile daemon)
 
-      process daemon ["restart"] = do process daemon ["stop"]
-                                      process daemon ["start"]
+      process daemon ServiceActionRestart = do process daemon ServiceActionStop
+                                               process daemon ServiceActionStart
 
-      process daemon ["status"] = pidExists daemon >>= f where
+      process daemon ServiceActionStatus = pidExists daemon >>= f where
         f True =
           do pid <- pidRead daemon
              case pid of
@@ -190,9 +218,6 @@ serviced daemon = do
                       do putStrLn $ (fromJust $ name daemon) ++ " is running."
                          else putStrLn $ (fromJust $ name daemon) ++ " is not running, but pidfile is remaining."
         f False = putStrLn $ (fromJust $ name daemon) ++ " is not running."
-
-      process _      _ =
-        getProgName >>= \pname -> putStrLn $ "usage: " ++ pname ++ " {start|stop|status|restart}"
 
       -- Wait 'secs' seconds for the process to exit, checking
       -- for liveness once a second.  If still alive send sigKILL.
