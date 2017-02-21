@@ -1,8 +1,9 @@
-`hdaemonize-0.4.3`
+`hdaemonize`
 =================
+[![Build Status](https://travis-ci.org/greydot/hdaemonize.svg?branch=master)](https://travis-ci.org/greydot/hdaemonize)
 
 `hdaemonize` is a simple library that hides some of the complexities
-of writing UNIX daemons in Haskell.  
+of writing UNIX daemons in Haskell.
 
 Obtaining
 -----------
@@ -42,7 +43,7 @@ Let us say this program is compiled as `mydaemon`. Then:
     # mydaemon start
 
 starts the service. A second call to start will complain that the
-program is already running. 
+program is already running.
 
 During its execution, mydaemon will simply write a new number to
 `/tmp/counter` every second, until it reaches 5. Then, an exception
@@ -58,7 +59,7 @@ The following commands are also made available:
 
     # mydaemon stop
     # mydaemon restart
- 
+
 Finally, `mydaemon` drops privileges.  By default it changes the
 effective user and group ids to those of the `daemon` user, but it
 prefers to use those of `mydaemon`, if present.
@@ -66,6 +67,12 @@ prefers to use those of `mydaemon`, if present.
 
 Changelog
 ---------
+
+* 0.5.2
+    * Fix pre-AMP builds.
+
+* 0.5.1
+    * Updated to use hsyslog >=4
 
 * 0.4
     * added support for a privileged action before dropping privileges
@@ -83,9 +90,9 @@ Changelog
 
 Authors
 -------
+Lana Black <lanablack@amok.cc>
 
-Anton Tayanovskyy <name.surname@gmail.com>, bug reports and feature
-requests welcome.
+Anton Tayanovskyy <name.surname@gmail.com>.
 
 The code is originally based on a public posting by
 [Andre Nathan](http://sneakymustard.com/), used by permission.

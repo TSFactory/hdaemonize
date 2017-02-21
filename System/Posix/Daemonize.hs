@@ -1,4 +1,6 @@
-{-# LANGUAGE OverloadedStrings, RankNTypes #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 module System.Posix.Daemonize (
   -- * Simple daemonization
   daemonize,
@@ -6,9 +8,6 @@ module System.Posix.Daemonize (
   serviced, ServiceAction(..), servicedNoArgs, CreateDaemon(..), simpleDaemon,
   -- * Intradaemon utilities
   fatalError, exitCleanly
-#if MIN_VERSION_hsyslog(4,0,0)
-  , SyslogFn
-#endif
   -- * An example
   --
   -- | Here is an example of a full program which writes a message to
@@ -19,11 +18,12 @@ module System.Posix.Daemonize (
   -- first one, then delays for the rest and eventually writes a line
   -- about how many times it has seen it.
   --
+  -- > {-# LANGUAGE OverloadedStrings #-}
   -- > module Main where
   -- >
   -- > import System.Posix.Daemonize (CreateDaemon(..), serviced, simpleDaemon)
   -- > import System.Posix.Signals (installHandler, Handler(Catch), sigHUP, fullSignalSet)
-  -- > import System.Posix.Syslog (syslog, Priority(Notice))
+  -- > import System.Posix.Syslog (syslogUnsafe, Facility(DAEMON), Priority(Notice))
   -- > import Control.Concurrent (threadDelay)
   -- > import Control.Monad (forever)
   -- >
@@ -37,10 +37,10 @@ module System.Posix.Daemonize (
   -- > stillAliveMain _ = do
   -- >   installHandler sigHUP (Catch taunt) (Just fullSignalSet)
   -- >   forever $ do threadDelay (10^6)
-  -- >                syslog Notice "I'm still alive!"
+  -- >                syslog DAEMON Notice "I'm still alive!"
   -- >
   -- > taunt :: IO ()
-  -- > taunt = syslog Notice "I sneeze in your general direction, you and your SIGHUP."
+  -- > taunt = syslogUnsafe DAEMON Notice "I sneeze in your general direction, you and your SIGHUP."
 
   ) where
 
@@ -59,18 +59,21 @@ import Prelude
 import Prelude hiding (catch)
 #endif
 
+#if !(MIN_VERSION_base(4,8,0))
+import Control.Applicative ((<$), (<$>))
+#endif
+
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as ByteString
+import Data.Maybe (isNothing, fromMaybe, fromJust)
 import System.Environment
 import System.Exit
 import System.Posix
-#if MIN_VERSION_hsyslog(4,0,0)
-import System.Posix.Syslog (withSyslog, SyslogConfig(..), Option(..),Priority(..),Facility(..), PriorityMask(..), SyslogFn)
-#else
-import System.Posix.Syslog (withSyslog,Option(..),Priority(..),Facility(..),syslog)
-#endif
+import System.Posix.Syslog (withSyslog,SyslogConfig(..),Option(..),Priority(..),PriorityMask(..),Facility(..),syslogUnsafe)
 import System.FilePath.Posix (joinPath)
-import Data.Maybe (isNothing, fromMaybe, fromJust)
-import qualified Data.ByteString.Char8 as B8
 
+syslog :: Priority -> ByteString -> IO ()
+syslog = syslogUnsafe DAEMON
 
 -- | Turning a process into a daemon involves a fixed set of
 -- operations on unix systems, described in section 13.3 of Stevens
@@ -92,18 +95,14 @@ import qualified Data.ByteString.Char8 as B8
 -- which does nothing until killed.
 
 daemonize :: IO () -> IO ()
-daemonize program =
-
-  do setFileCreationMask 0
-     forkProcess p
-     exitImmediately ExitSuccess
-
+daemonize program = do
+        setFileCreationMask 0
+        forkProcess p
+        exitImmediately ExitSuccess
     where
-
       p  = do createSession
               forkProcess p'
               exitImmediately ExitSuccess
-
       p' = do changeWorkingDirectory "/"
               closeFileDescriptors
               blockSignal sigHUP
@@ -178,24 +177,18 @@ data ServiceAction
 -- or as a regular console application.
 servicedNoArgs :: ServiceAction -> CreateDaemon a -> IO ()
 servicedNoArgs action daemon = do
-  systemName <- getProgName
-  let daemon' = daemon { name = if isNothing (name daemon)
-                                then Just systemName else name daemon }
-  process daemon' action
+        systemName <- getProgName
+        let daemon' = daemon { name = if isNothing (name daemon)
+                                        then Just systemName else name daemon }
+        process daemon' action
     where
-#if MIN_VERSION_hsyslog(4,0,0)
-      program' daemon = withSyslog (SyslogConfig (B8.pack . fromJust $ name daemon) (syslogOptions daemon) DAEMON NoMask) $ \syslog ->
-#elif MIN_VERSION_hsyslog(2,0,0)
-      program' daemon = withSyslog (fromJust $ name daemon) (syslogOptions daemon) DAEMON [] $
-#else
-      program' daemon = withSyslog (fromJust $ name daemon) (syslogOptions daemon) DAEMON $
-#endif
-                      do let log = syslog DAEMON Notice . B8.pack
+      program' daemon = withSyslog (SyslogConfig (ByteString.pack $ fromJust $ name daemon) (syslogOptions daemon) DAEMON NoMask) $ \_ ->
+                      do let log = syslog Notice
                          log "starting"
                          pidWrite daemon
                          privVal <- privilegedAction daemon
                          dropPrivileges daemon
-                         forever syslog $ program daemon syslog privVal
+                         forever $ program daemon privVal
 
       process daemon ServiceActionStart = pidExists daemon >>= f where
           f True  = do error "PID file exists. Process already running?"
@@ -207,10 +200,10 @@ servicedNoArgs action daemon = do
              case pid of
                Nothing  -> pass
                Just pid ->
-                   (do whenM (pidLive pid) $
-                            do signalProcess sigTERM pid
-                               usleep (10^3)
-                               wait (killWait daemon) pid)
+                   whenM (pidLive pid)
+                            (do signalProcess sigTERM pid
+                                usleep (10^3)
+                                wait (killWait daemon) pid)
                    `finally`
                    removeLink (pidFile daemon)
 
@@ -221,13 +214,13 @@ servicedNoArgs action daemon = do
         f True =
           do pid <- pidRead daemon
              case pid of
-               Nothing -> putStrLn $ (fromJust $ name daemon) ++ " is not running."
+               Nothing -> putStrLn $ fromJust (name daemon) ++ " is not running."
                Just pid ->
                  do res <- pidLive pid
                     if res then
-                      do putStrLn $ (fromJust $ name daemon) ++ " is running."
-                         else putStrLn $ (fromJust $ name daemon) ++ " is not running, but pidfile is remaining."
-        f False = putStrLn $ (fromJust $ name daemon) ++ " is not running."
+                              putStrLn $ fromJust (name daemon) ++ " is running."
+                         else putStrLn $ fromJust (name daemon) ++ " is not running, but pidfile is remaining."
+        f False = putStrLn $ fromJust (name daemon) ++ " is not running."
 
       -- Wait 'secs' seconds for the process to exit, checking
       -- for liveness once a second.  If still alive send sigKILL.
@@ -251,7 +244,7 @@ data CreateDaemon a = CreateDaemon {
   privilegedAction :: IO a, -- ^ An action to be run as root, before
                             -- permissions are dropped, e.g., binding
                             -- a trusted port.
-  program :: SyslogFn -> a -> IO (),
+  program :: a -> IO (),
                          -- ^ The actual guts of the daemon, more or less
                          -- the @main@ function.  Its argument is the result
                          -- of running 'privilegedAction' before dropping
@@ -323,35 +316,37 @@ simpleDaemon = CreateDaemon {
 
 {- implementation -}
 
-forever :: SyslogFn -> IO () -> IO ()
-forever syslog program =
+forever :: IO () -> IO ()
+forever program =
     program `catch` restart where
         restart :: SomeException -> IO ()
         restart e =
-            do syslog DAEMON Error (B8.pack $ "unexpected exception: " ++ show e)
-               syslog DAEMON Error "restarting in 5 seconds"
+            do syslog Error $ ByteString.pack ("unexpected exception: " ++ show e)
+               syslog Error "restarting in 5 seconds"
                usleep (5 * 10^6)
-               forever syslog program
+               forever program
 
 closeFileDescriptors :: IO ()
 closeFileDescriptors =
     do null <- openFd "/dev/null" ReadWrite Nothing defaultFileFlags
        let sendTo fd' fd = closeFd fd >> dupTo fd' fd
-       mapM_ (sendTo null) $ [stdInput, stdOutput, stdError]
+       mapM_ (sendTo null) [stdInput, stdOutput, stdError]
 
 blockSignal :: Signal -> IO ()
 blockSignal sig = installHandler sig Ignore Nothing >> pass
 
 getGroupID :: String -> IO (Maybe GroupID)
 getGroupID group =
-    try (fmap groupID (getGroupEntryForName group)) >>= return . f where
+        f <$> try (fmap groupID (getGroupEntryForName group))
+    where
         f :: Either IOException GroupID -> Maybe GroupID
         f (Left _)    = Nothing
         f (Right gid) = Just gid
 
 getUserID :: String -> IO (Maybe UserID)
 getUserID user =
-    try (fmap userID (getUserEntryForName user)) >>= return . f where
+        f <$> try (fmap userID (getUserEntryForName user))
+    where
         f :: Either IOException UserID -> Maybe UserID
         f (Left _)    = Nothing
         f (Right uid) = Just uid
@@ -362,13 +357,13 @@ dropPrivileges daemon =
        Just gd <- getGroupID "daemon"
        let targetUser = fromMaybe (fromJust $ name daemon) (user daemon)
            targetGroup = fromMaybe (fromJust $ name daemon) (group daemon)
-       u       <- fmap (maybe ud id) $ getUserID targetUser
-       g       <- fmap (maybe gd id) $ getGroupID targetGroup
+       u <- fromMaybe ud <$> getUserID targetUser
+       g <- fromMaybe gd <$> getGroupID targetGroup
        setGroupID g
        setUserID u
 
 pidFile:: CreateDaemon a -> String
-pidFile daemon = joinPath [dir, (fromJust $ name daemon) ++ ".pid"]
+pidFile daemon = joinPath [dir, fromJust (name daemon) ++ ".pid"]
   where dir = fromMaybe "/var/run" (pidfileDirectory daemon)
 
 pidExists :: CreateDaemon a -> IO Bool
@@ -376,7 +371,7 @@ pidExists daemon = fileExist (pidFile daemon)
 
 pidRead :: CreateDaemon a -> IO (Maybe CPid)
 pidRead daemon = pidExists daemon >>= choose where
-    choose True  = fmap (Just . read) $ readFile (pidFile daemon)
+    choose True  = return . read <$> readFile (pidFile daemon)
     choose False = return Nothing
 
 pidWrite :: CreateDaemon a -> IO ()
@@ -397,16 +392,16 @@ pass = return ()
 -- is to write an error to the log and die messily, use fatalError.
 -- This is a good candidate for things like not being able to find
 -- configuration files on startup.
-fatalError :: MonadIO m => SyslogFn -> String -> m a
-fatalError syslog msg = liftIO $ do
-  syslog DAEMON Error . B8.pack $ "Terminating from error: " ++ msg
+fatalError :: MonadIO m => String -> m a
+fatalError msg = liftIO $ do
+  syslog Error $ ByteString.pack $ "Terminating from error: " ++ msg
   exitImmediately (ExitFailure 1)
   undefined -- You will never reach this; it's there to make the type checker happy
 
 -- | Use this function when the daemon should terminate normally.  It
 -- logs a message, and exits with status 0.
-exitCleanly :: MonadIO m => SyslogFn -> m a
-exitCleanly syslog = liftIO $ do
-  syslog DAEMON Notice "Exiting."
+exitCleanly :: MonadIO m => m a
+exitCleanly = liftIO $ do
+  syslog Notice "Exiting."
   exitImmediately ExitSuccess
   undefined -- You will never reach this; it's there to make the type checker happy
